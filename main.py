@@ -8,10 +8,9 @@ from supabase import create_client
 
 app = FastAPI()
 
-# 🔒 w trakcie dev zostawiamy *, po deployu zwężamy do konkretnego frontu
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],          # docelowo: ["http://localhost:3000", "https://twoj-front.vercel.app"]
+    allow_origins=["*"],  # po deployu zawęź do localhost:3000 i domeny z Vercel
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -64,12 +63,29 @@ def api_reply(data: Msg, authorization: str = Header(default="")):
     if authorization != f"Bearer {RICK_API_SECRET}":
         raise HTTPException(status_code=401, detail="Unauthorized")
 
-    sys = {"role":"system","content":SYSTEM_PROMPT}
+    # 1) Ustal / utwórz rozmowę
+    conv_id = data.conversation_id
+    if not conv_id:
+        res = sb.table("conversations").insert({"title": "Rick chat"}).execute()
+        conv_id = res.data[0]["id"]
 
+    # 2) Zapisz wiadomość użytkownika
+    sb.table("messages").insert({
+        "conversation_id": conv_id,
+        "role": "user",
+        "content": data.message
+    }).execute()
+
+    # 3) Logika Ricka
+    sys = {"role":"system","content":SYSTEM_PROMPT}
     if need_questions(data.message):
         q = chat([sys, {"role":"user","content":
              f"Zanim odpowiesz, zapytaj o max 1–2 brakujące informacje. Użytkownik: {data.message}"}], 0.3)
-        return {"type":"questions","content":q, "conversation_id": data.conversation_id}
+        # zapisz odpowiedź-pytanie
+        sb.table("messages").insert({
+            "conversation_id": conv_id, "role":"assistant", "content": q
+        }).execute()
+        return {"type":"questions","content":q, "conversation_id": conv_id}
 
     draft = chat([sys, {"role":"user","content":
         "Użyj pętli MZDS i odpowiedz wg formatu "
@@ -78,4 +94,23 @@ def api_reply(data: Msg, authorization: str = Header(default="")):
 
     final = chat([sys, {"role":"user","content": draft + "\n\n[Sprawdź jakość i podaj wersję finalną.]\n" + QUALITY}], 0.2)
 
-    return {"type":"answer","content":final, "conversation_id": data.conversation_id}
+    # 4) Zapisz odpowiedź
+    sb.table("messages").insert({
+        "conversation_id": conv_id, "role":"assistant", "content": final
+    }).execute()
+
+    return {"type":"answer","content":final, "conversation_id": conv_id}
+
+@app.get("/api/conversations")
+def api_conversations(authorization: str = Header(default="")):
+    if authorization != f"Bearer {RICK_API_SECRET}":
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    res = sb.table("conversations").select("*").order("created_at", desc=True).execute()
+    return {"items": res.data}
+
+@app.get("/api/history/{conversation_id}")
+def api_history(conversation_id: str, authorization: str = Header(default="")):
+    if authorization != f"Bearer {RICK_API_SECRET}":
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    res = sb.table("messages").select("role,content,created_at").eq("conversation_id", conversation_id).order("created_at").execute()
+    return {"messages": res.data}
